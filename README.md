@@ -117,7 +117,8 @@ game-compressor.elf
 ```
 
 The 13.60 build has been checked for successful compilation and ELF format.
-It still needs a launch test on a PS5 running that firmware.
+A locally built payload was also launched successfully on a PS5 running
+firmware 13.60.
 
 GitHub Actions builds the ELF on pushes and pull requests. Pushing a `v*` tag
 also creates or updates a GitHub Release containing `game-compressor.elf` and
