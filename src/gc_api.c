@@ -2930,6 +2930,17 @@ paths_equal_ignoring_trailing_slash(const char *a, const char *b) {
 }
 
 static int
+shadowmount_image_link_matches(const char *actual, int has_image,
+                               const char *expected_image,
+                               const char *expected_outer_image) {
+  if(!expected_image || !expected_image[0]) return !has_image;
+  return has_image &&
+      (paths_equal_ignoring_trailing_slash(actual, expected_image) ||
+       (expected_outer_image && expected_outer_image[0] &&
+        paths_equal_ignoring_trailing_slash(actual, expected_outer_image)));
+}
+
+static int
 system_ex_title_bound_to(const char *title_id,
                          const char *expected_mount_source,
                          char *actual_type, size_t actual_type_size,
@@ -2972,20 +2983,38 @@ system_ex_title_bound_to(const char *title_id,
   }
 
   if(stat(eboot, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
-  if(!statfs_ok) return 0;
-  if(strcmp(fs.f_fstypename, "nullfs") != 0) return 0;
-  if(expected_mount_source && expected_mount_source[0] &&
-     !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
-                                          expected_mount_source)) {
+  if(!expected_mount_source || !expected_mount_source[0]) return 0;
+  if(statfs_ok &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntonname, mountpoint) &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
+                                         expected_mount_source)) {
+    return 1;
+  }
+  if(statfs_ok &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntonname, mountpoint)) {
     return 0;
   }
-  return 1;
+  /* statfs can report the image filesystem below ShadowMountPlus's nullfs.
+   * Inspect the mount table for the exact /system_ex/app binding instead. */
+  struct statfs *mounts = NULL;
+  int mount_count = getmntinfo(&mounts, MNT_NOWAIT);
+  for(int i = 0; i < mount_count; i++) {
+    if(strcmp(mounts[i].f_fstypename, "nullfs") == 0 &&
+       paths_equal_ignoring_trailing_slash(mounts[i].f_mntonname,
+                                            mountpoint) &&
+       paths_equal_ignoring_trailing_slash(mounts[i].f_mntfromname,
+                                            expected_mount_source)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static int
 wait_for_shadowmount_links(const char *title_id,
                            const char *expected_mount_link,
                            const char *expected_image_link,
+                           const char *expected_outer_image_link,
                            char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REMOUNT_WAIT_SECONDS;
   char mount_link[1024];
@@ -2999,10 +3028,11 @@ wait_for_shadowmount_links(const char *title_id,
   int restart_recovery_attempted = 0;
 
   if(err && err_size) err[0] = 0;
-  gc_log("shadowmount wait title=%s mount=%s image=%s",
+  gc_log("shadowmount wait title=%s mount=%s image=%s outer=%s",
          title_id ? title_id : "",
          expected_mount_link ? expected_mount_link : "",
-         expected_image_link ? expected_image_link : "");
+         expected_image_link ? expected_image_link : "",
+         expected_outer_image_link ? expected_outer_image_link : "");
 
   while(1) {
     if(gc_cancel_requested(err, err_size)) {
@@ -3016,9 +3046,9 @@ wait_for_shadowmount_links(const char *title_id,
                                     sizeof(image_link)) == 0;
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
-    int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
-        : !has_image;
+    int image_ok = shadowmount_image_link_matches(
+        image_link, has_image, expected_image_link,
+        expected_outer_image_link);
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
         actual_source, sizeof(actual_source), actual_mountpoint,
@@ -3107,6 +3137,18 @@ wait_for_shadowmount_links(const char *title_id,
                title_id ? title_id : "",
                restart_detail[0] ? restart_detail : "unknown");
       }
+      gc_log("shadowmount wait mismatch title=%s mount=%s expectedMount=%s "
+             "image=%s expectedImage=%s expectedOuter=%s "
+             "systemExType=%s systemExFrom=%s systemExOn=%s",
+             title_id ? title_id : "",
+             has_mount ? mount_link : "(missing)",
+             expected_mount_link ? expected_mount_link : "",
+             has_image ? image_link : "(missing)",
+             expected_image_link ? expected_image_link : "",
+             expected_outer_image_link ? expected_outer_image_link : "",
+             actual_type[0] ? actual_type : "(unknown)",
+             actual_source[0] ? actual_source : "(unknown)",
+             actual_mountpoint[0] ? actual_mountpoint : "(unknown)");
       snprintf(err, err_size,
                "ShadowMountPlus did not remount %s; mount.lnk=%s%s%s "
                "mount_img.lnk=%s%s%s system_ex=%s:%s%s%s",
@@ -5115,7 +5157,7 @@ post_repair_smoke_verify(const char *title_id, const char *path,
     }
     job_set_phase("mounting", 0, 0, "Waiting for repair remount");
     if(wait_for_shadowmount_links(title_id, expected_mount, expected_image,
-                                  err, err_size) != 0) {
+                                  path, err, err_size) != 0) {
       return -1;
     }
   }
@@ -5179,7 +5221,7 @@ wait_for_compressed_shadowmount(const char *title_id, const char *path,
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
   return wait_for_shadowmount_links(title_id, expected_mount, expected_image,
-                                    err, err_size);
+                                    path, err, err_size);
 }
 
 static int
@@ -5203,7 +5245,7 @@ wait_for_image_shadowmount(const char *title_id, const char *path,
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
   return wait_for_shadowmount_links(title_id, expected_mount, path,
-                                    err, err_size);
+                                    NULL, err, err_size);
 }
 
 static int
@@ -6120,6 +6162,7 @@ static int
 mount_switch_clear_stale_links(const char *title_id,
                                const char *expected_mount,
                                const char *expected_image,
+                               const char *expected_outer_image,
                                gc_mount_link_backup_t *backup,
                                char *err, size_t err_size) {
   int mount_matches;
@@ -6151,11 +6194,9 @@ mount_switch_clear_stale_links(const char *title_id,
   mount_matches =
       paths_equal_ignoring_trailing_slash(backup->mount_value,
                                           expected_mount);
-  image_matches = expected_image && expected_image[0]
-      ? (backup->had_image &&
-         paths_equal_ignoring_trailing_slash(backup->image_value,
-                                             expected_image))
-      : !backup->had_image;
+  image_matches = shadowmount_image_link_matches(
+      backup->image_value, backup->had_image, expected_image,
+      expected_outer_image);
   if(mount_matches && image_matches) return 0;
 
   if(unlink(backup->mount_link_path) != 0 && errno != ENOENT) {
@@ -6387,7 +6428,10 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
   artifact_cache_invalidate();
   if(gc_cancel_requested(err, err_size)) return -1;
   if(mount_switch_clear_stale_links(op->title_id, expected_mount,
-                                    expected_image, &link_backup,
+                                    expected_image,
+                                    selected->source_kind == GC_SOURCE_COMPRESSED
+                                        ? selected->source_path : NULL,
+                                    &link_backup,
                                     err, err_size) != 0) {
     return -1;
   }
@@ -6417,6 +6461,8 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
 
   err[0] = 0;
   if(wait_for_shadowmount_links(op->title_id, expected_mount, expected_image,
+                                selected->source_kind == GC_SOURCE_COMPRESSED
+                                    ? selected->source_path : NULL,
                                 err, err_size) == 0) {
     return 0;
   }
@@ -6458,7 +6504,10 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
   if(gc_cancel_requested(err, err_size)) return -1;
   artifact_cache_invalidate();
   if(mount_switch_clear_stale_links(op->title_id, expected_mount,
-                                    expected_image, &link_backup,
+                                    expected_image,
+                                    game->source_kind == GC_SOURCE_COMPRESSED
+                                        ? game->source_path : NULL,
+                                    &link_backup,
                                     err, err_size) != 0) {
     return -1;
   }
@@ -6504,7 +6553,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
       return -1;
     }
     if(wait_for_shadowmount_links(op->title_id, expected_mount,
-                                  expected_image, err, err_size) != 0) {
+                                  expected_image, NULL, err, err_size) != 0) {
       (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
                                                sizeof(scan_err));
       return -1;
@@ -8702,7 +8751,10 @@ run_refresh_mount_op(gc_operation_t *op) {
   artifact_cache_invalidate();
   if(gc_cancel_requested(op->error, sizeof(op->error))) goto restore_and_fail;
   if(mount_switch_clear_stale_links(op->title_id, expected_mount,
-                                    expected_image, &link_backup,
+                                    expected_image,
+                                    game.source_kind == GC_SOURCE_COMPRESSED
+                                        ? game.source_path : NULL,
+                                    &link_backup,
                                     err, sizeof(err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "could not clear stale mount state");
@@ -8732,6 +8784,8 @@ run_refresh_mount_op(gc_operation_t *op) {
   if(gc_cancel_requested(op->error, sizeof(op->error))) goto restore_and_fail;
   err[0] = 0;
   if(wait_for_shadowmount_links(op->title_id, expected_mount, expected_image,
+                                game.source_kind == GC_SOURCE_COMPRESSED
+                                    ? game.source_path : NULL,
                                 err, sizeof(err)) == 0) {
     mount_ready = 1;
   } else if(shadowmount_mount_missed(err)) {
