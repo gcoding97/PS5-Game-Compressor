@@ -3,6 +3,8 @@
  */
 
 #include "gc_shadowmount.h"
+#include "gc_shadowmount_api.h"
+#include "gc_diag.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -18,6 +20,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -1102,6 +1105,114 @@ gc_shadowmount_request_source_scan(const char *source_path,
   return request_source_scan_locked(NULL, source_path, err, err_size);
 }
 
+static int
+api_wait_until_unmounted(char *err, size_t err_size) {
+  for(int attempt = 0; attempt < 20; attempt++) {
+    char mounted_title[GC_SM_TITLE_ID_LEN] = {0};
+    char api_err[256] = {0};
+    int found = gc_shadowmount_api_find_mounted_game(
+        mounted_title, sizeof(mounted_title), api_err, sizeof(api_err));
+    if(found == 0) return 0;
+    if(found < 0) {
+      snprintf(err, err_size, "ShadowMount API mount query: %s",
+               api_err[0] ? api_err : "unknown error");
+      return -1;
+    }
+    usleep(500000);
+  }
+  set_err(err, err_size, "ShadowMount API did not release the previous mount");
+  return -1;
+}
+
+static int
+api_wait_for_selected_game(const char *title_id, const char *source_path,
+                           int require_mounted, char *err, size_t err_size) {
+  struct stat source_stat;
+  int have_source_stat = stat(source_path, &source_stat) == 0;
+  for(int attempt = 0; attempt < 120; attempt++) {
+    gc_sm_game_t game = {0};
+    gc_sm_image_t image = {0};
+    char api_err[256] = {0};
+    int image_ok = gc_shadowmount_api_find_image(
+        source_path, &image, api_err, sizeof(api_err)) == 1 &&
+        image.complete && image.source_available &&
+        (!have_source_stat || image.mtime_sec == (long long)source_stat.st_mtime);
+    int game_ok = image_ok && gc_shadowmount_api_get_game_info(
+        title_id, &game, api_err, sizeof(api_err)) == 0 &&
+        strcmp(game.path, source_path) == 0;
+    if(game_ok && image_ok && (!require_mounted || game.mounted)) return 0;
+    usleep(500000);
+  }
+  snprintf(err, err_size,
+           "ShadowMount API did not register %s as the %s source for %s",
+           source_path, require_mounted ? "mounted" : "selected", title_id);
+  return -1;
+}
+
+int
+gc_shadowmount_api_mount_selected(const char *title_id,
+                                  const char *source_path,
+                                  char *err, size_t err_size) {
+  char mounted_title[GC_SM_TITLE_ID_LEN] = {0};
+  char api_err[256] = {0};
+  gc_sm_game_t old_game = {0};
+  size_t path_len;
+  int mounted;
+
+  if(err && err_size) err[0] = 0;
+  if(!gc_shadowmount_api_available() ||
+     !shadowmount_title_id_valid(title_id) ||
+     !source_path || source_path[0] != '/') {
+    set_err(err, err_size, "ShadowMount API source is unavailable");
+    return -1;
+  }
+  path_len = strlen(source_path);
+  if(path_len < 7 || strcasecmp(source_path + path_len - 7, ".ffpfsc") != 0) {
+    set_err(err, err_size, "ShadowMount API requires a compressed image");
+    return -1;
+  }
+
+  mounted = gc_shadowmount_api_find_mounted_game(
+      mounted_title, sizeof(mounted_title), api_err, sizeof(api_err));
+  if(mounted < 0) {
+    snprintf(err, err_size, "ShadowMount API mount query: %s",
+             api_err[0] ? api_err : "unknown error");
+    return -1;
+  }
+  if(mounted > 0 &&
+     gc_shadowmount_api_unmount_game(mounted_title, err, err_size) != 0) {
+    return -1;
+  }
+  if(api_wait_until_unmounted(err, err_size) != 0) return -1;
+
+  if(gc_shadowmount_api_get_game_info(title_id, &old_game,
+                                       api_err, sizeof(api_err)) == 0 &&
+     old_game.path[0] && strcmp(old_game.path, source_path) != 0) {
+    char remove_err[256] = {0};
+    if(gc_shadowmount_api_remove_manual_source(old_game.path, NULL,
+                                                remove_err,
+                                                sizeof(remove_err)) != 0) {
+      gc_log("shadowmount api old source removal title=%s path=%s err=%s",
+             title_id, old_game.path,
+             remove_err[0] ? remove_err : "unknown");
+    }
+  }
+  if(gc_shadowmount_api_add_manual_source(source_path, NULL,
+                                           err, err_size) != 0 ||
+     gc_shadowmount_api_scan(err, err_size) != 0) {
+    return -1;
+  }
+  if(api_wait_for_selected_game(title_id, source_path, 0,
+                                err, err_size) != 0) return -1;
+  if(gc_shadowmount_api_mount_game_mode(title_id, "ro", err, err_size) != 0) {
+    return -1;
+  }
+  if(api_wait_for_selected_game(title_id, source_path, 1,
+                                err, err_size) != 0) return -1;
+  gc_log("shadowmount api mounted title=%s source=%s", title_id, source_path);
+  return 0;
+}
+
 int
 gc_shadowmount_request_title_source_scan(const char *title_id,
                                          const char *source_path,
@@ -1109,6 +1220,12 @@ gc_shadowmount_request_title_source_scan(const char *title_id,
   if(!shadowmount_title_id_valid(title_id)) {
     set_err(err, err_size, "bad ShadowMount title id");
     return -1;
+  }
+  if(gc_shadowmount_api_available() && source_path &&
+     strlen(source_path) >= 7 &&
+     strcasecmp(source_path + strlen(source_path) - 7, ".ffpfsc") == 0) {
+    return gc_shadowmount_api_mount_selected(title_id, source_path,
+                                             err, err_size);
   }
   return request_source_scan_locked(title_id, source_path, err, err_size);
 }

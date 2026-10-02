@@ -26,6 +26,7 @@
 #include "gc_icon_thumb.h"
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
+#include "gc_shadowmount_api.h"
 #include "gc_size_cache.h"
 #include "pfs_ampr_hotswap.h"
 #include "pfs_compress.h"
@@ -5260,6 +5261,11 @@ force_compressed_path_bounce_remount(const char *title_id,
   int cancelled = 0;
 
   if(gc_cancel_requested(err, err_size)) return -1;
+  if(gc_shadowmount_api_available()) {
+    job_set_phase("mounting", 0, 0, "Remounting with ShadowMountPlus");
+    return gc_shadowmount_request_title_source_scan_cancelable(
+        title_id, original_path, err, err_size);
+  }
   if(build_force_remount_temp_path(original_path, title_id, temp_path,
                                    sizeof(temp_path)) != 0) {
     snprintf(err, err_size, "%s", "could not build compressed remount temp path");
@@ -6395,6 +6401,7 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
   char expected_image[1024] = {0};
   char scan_err[256] = {0};
   gc_mount_link_backup_t link_backup;
+  int use_sm_api = 0;
 
   memset(&link_backup, 0, sizeof(link_backup));
   if(hidden_count) *hidden_count = 0;
@@ -6416,6 +6423,14 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
     return -1;
   }
   if(gc_cancel_requested(err, err_size)) return -1;
+  if(selected->source_kind == GC_SOURCE_COMPRESSED) {
+    char api_err[256] = {0};
+    use_sm_api = gc_shadowmount_api_available() ||
+        gc_shadowmount_api_probe(NULL, api_err, sizeof(api_err)) == 0;
+    gc_log("shadowmount compressed mount backend title=%s backend=%s detail=%s",
+           op->title_id, use_sm_api ? "api" : "legacy",
+           use_sm_api ? "available" : (api_err[0] ? api_err : "unavailable"));
+  }
 
   gc_checkpoint("mount selected hide competitors");
   append_operation_phase(op, "hiding");
@@ -6427,6 +6442,13 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
   }
   artifact_cache_invalidate();
   if(gc_cancel_requested(err, err_size)) return -1;
+  if(use_sm_api) {
+    gc_checkpoint("mount selected via ShadowMount API");
+    append_operation_phase(op, "mounting");
+    job_set_phase("mounting", 0, 0, "Mounting with ShadowMountPlus");
+    return gc_shadowmount_request_title_source_scan_cancelable(
+        selected->title_id, selected->source_path, err, err_size);
+  }
   if(mount_switch_clear_stale_links(op->title_id, expected_mount,
                                     expected_image,
                                     selected->source_kind == GC_SOURCE_COMPRESSED
