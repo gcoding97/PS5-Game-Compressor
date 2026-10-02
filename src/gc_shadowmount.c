@@ -1129,6 +1129,9 @@ api_wait_for_selected_game(const char *title_id, const char *source_path,
                            int require_mounted, char *err, size_t err_size) {
   struct stat source_stat;
   int have_source_stat = stat(source_path, &source_stat) == 0;
+  char observed_path[GC_SM_PATH_LEN] = {0};
+  int observed_image_ready = 0;
+  int observed_mounted = 0;
   for(int attempt = 0; attempt < 120; attempt++) {
     gc_sm_game_t game = {0};
     gc_sm_image_t image = {0};
@@ -1137,15 +1140,24 @@ api_wait_for_selected_game(const char *title_id, const char *source_path,
         source_path, &image, api_err, sizeof(api_err)) == 1 &&
         image.complete && image.source_available &&
         (!have_source_stat || image.mtime_sec == (long long)source_stat.st_mtime);
-    int game_ok = image_ok && gc_shadowmount_api_get_game_info(
-        title_id, &game, api_err, sizeof(api_err)) == 0 &&
-        strcmp(game.path, source_path) == 0;
+    int game_ok = 0;
+    observed_image_ready = image_ok;
+    if(image_ok && gc_shadowmount_api_get_game_info(
+        title_id, &game, api_err, sizeof(api_err)) == 0) {
+      snprintf(observed_path, sizeof(observed_path), "%s", game.path);
+      observed_mounted = game.mounted;
+      game_ok = strcmp(game.path, source_path) == 0;
+    }
     if(game_ok && image_ok && (!require_mounted || game.mounted)) return 0;
     usleep(500000);
   }
-  snprintf(err, err_size,
-           "ShadowMount API did not register %s as the %s source for %s",
-           source_path, require_mounted ? "mounted" : "selected", title_id);
+  gc_log("shadowmount api source timeout title=%s expected=%s actual=%s "
+         "imageReady=%d mounted=%d requireMounted=%d",
+         title_id, source_path, observed_path[0] ? observed_path : "(unknown)",
+         observed_image_ready, observed_mounted, require_mounted);
+  snprintf(err, err_size, "ShadowMount API did not %s %s (image=%d mounted=%d)",
+           require_mounted ? "mount" : "register", title_id,
+           observed_image_ready, observed_mounted);
   return -1;
 }
 
