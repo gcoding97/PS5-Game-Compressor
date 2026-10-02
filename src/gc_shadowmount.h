@@ -48,4 +48,11 @@ int gc_shadowmount_request_title_source_scan(const char *title_id,
 int gc_shadowmount_request_scan(char *err, size_t err_size);
 int gc_shadowmount_restart_running(char *detail, size_t detail_size);
 
+// ShadowMountPlus 1.7+ HTTP API. Return 0 on success, the ShadowMountPlus
+// errno status when the request was rejected, or -1 if the API is unreachable.
+int gc_shadowmount_api_mount_title(const char *title_id,
+                                   char *detail, size_t detail_size);
+int gc_shadowmount_api_unmount_title(const char *title_id,
+                                     char *detail, size_t detail_size);
+
 #endif
