@@ -3119,7 +3119,8 @@ release_stale_shadowmount_runtime_hold(void) {
   rc = gc_shadowmount_api_unmount_title(title_id, detail, sizeof(detail));
   gc_log("shadowmount stale hold release title=%s rc=%d detail=%s",
          title_id, rc, detail);
-  if(rc >= 0) (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+  // Positive results are API errno values, not successful cleanup.
+  if(rc == 0) (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
 }
 
 static int
@@ -6702,7 +6703,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
 }
 
 static int
-update_ampr_verify_mounted_hash(const char *title_id,
+update_ampr_verify_mounted_hash_mounted(const char *title_id,
                                 const char *mounted_root,
                                 const char *expected_sha,
                                 char *err, size_t err_size) {
@@ -6731,6 +6732,24 @@ update_ampr_verify_mounted_hash(const char *title_id,
   gc_log("update-ampr mounted verify title=%s path=%s sha=%s",
          title_id ? title_id : "", ampr_path, mounted_sha);
   return 0;
+}
+
+// Link readiness on ShadowMountPlus 1.7 does not keep the image mounted.
+// Hold it for the actual AMPR read, just as validation and smoke verification do.
+static int
+update_ampr_verify_mounted_hash(const char *title_id,
+                                const char *mounted_root,
+                                const char *expected_sha,
+                                char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = update_ampr_verify_mounted_hash_mounted(title_id, mounted_root,
+                                               expected_sha, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
 }
 
 static int
