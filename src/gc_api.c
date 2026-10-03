@@ -65,6 +65,9 @@
 #define GC_MOUNT_HIDE_PREFIX ".gc-hide-"
 #define GC_WORKER_THREAD_STACK_SIZE (1024 * 1024)
 #define GC_SYSTEM_APP_BASE "/system_ex/app"
+#define GC_SHADOWMOUNT_RUNTIME_SOCKET "/system_tmp/shadowmount.sock"
+#define GC_SHADOWMOUNT_HOLD_FILE GC_BASE "/shadowmount-runtime-hold"
+#define GC_SHADOWMOUNT_HOLD_BUSY_SECONDS 30
 #define GC_SHADOW_PFSC_BASE "/mnt/shadowmnt/pfsc"
 #define GC_SHADOW_IMAGE_BASE "/mnt/shadowmnt"
 #define GC_SHADOW_CONFIG_FILE "/data/shadowmount/config.ini"
@@ -2929,6 +2932,40 @@ paths_equal_ignoring_trailing_slash(const char *a, const char *b) {
   return alen == blen && memcmp(a, b, alen) == 0;
 }
 
+// ShadowMountPlus 1.2+ writes mount_img.lnk as one path per line for nested
+// images (outer .ffpfsc, then the inner image); older builds write one line.
+static int
+read_link_file_all(const char *path, char *out, size_t out_size) {
+  FILE *f = fopen(path, "r");
+  size_t len;
+  if(!f) return -1;
+  len = fread(out, 1, out_size - 1, f);
+  fclose(f);
+  out[len] = 0;
+  while(len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r' ||
+                    out[len - 1] == ' ')) {
+    out[--len] = 0;
+  }
+  return out[0] ? 0 : -1;
+}
+
+static int
+link_text_has_line(const char *text, const char *expected) {
+  char line[1024];
+  const char *p = text;
+  while(p && *p) {
+    size_t len = strcspn(p, "\r\n");
+    if(len > 0 && len < sizeof(line)) {
+      memcpy(line, p, len);
+      line[len] = 0;
+      if(paths_equal_ignoring_trailing_slash(line, expected)) return 1;
+    }
+    p += len;
+    p += strspn(p, "\r\n");
+  }
+  return 0;
+}
+
 static int
 system_ex_title_bound_to(const char *title_id,
                          const char *expected_mount_source,
@@ -2982,6 +3019,110 @@ system_ex_title_bound_to(const char *title_id,
   return 1;
 }
 
+// ShadowMountPlus 1.7+ binds /system_ex/app/<title> only while a game is being
+// launched and drops it after every scan; its ShellCore bridge socket exists
+// only while that runtime is active.
+static int
+shadowmount_on_demand_runtime(void) {
+  struct stat st;
+  return stat(GC_SHADOWMOUNT_RUNTIME_SOCKET, &st) == 0 && S_ISSOCK(st.st_mode);
+}
+
+static void release_stale_shadowmount_runtime_hold(void);
+
+// On ShadowMountPlus 1.7+ a registered game is not mounted until launch, so
+// operations that read the mounted tree ask its API to mount the title and
+// release it afterwards. The marker lets startup release a hold left behind
+// by a crash; ShadowMountPlus refuses the release while the game is running.
+static int
+shadowmount_runtime_hold(const char *title_id, int *held,
+                         char *err, size_t err_size) {
+  char detail[256] = {0};
+  char mount_link[1024];
+  time_t busy_deadline = time(NULL) + GC_SHADOWMOUNT_HOLD_BUSY_SECONDS;
+  int rc;
+  FILE *f;
+
+  *held = 0;
+  if(!valid_title_id(title_id) || !shadowmount_on_demand_runtime() ||
+     read_title_link(title_id, "mount.lnk", mount_link,
+                     sizeof(mount_link)) != 0 ||
+     system_ex_title_bound_to(title_id, mount_link, NULL, 0, NULL, 0,
+                              NULL, 0)) {
+    return 0;
+  }
+  release_stale_shadowmount_runtime_hold();
+  f = fopen(GC_SHADOWMOUNT_HOLD_FILE, "w");
+  if(f) {
+    fprintf(f, "%s\n", title_id);
+    fclose(f);
+  }
+  job_set_phase("mounting", 0, 0, "Mounting with ShadowMountPlus");
+  while(1) {
+    detail[0] = 0;
+    rc = gc_shadowmount_api_mount_title(title_id, detail, sizeof(detail));
+    // EBUSY is also returned while a scan or release is still in progress.
+    if(rc != EBUSY || time(NULL) >= busy_deadline) break;
+    if(gc_sleep_cancelable_seconds(1, err, err_size) != 0) {
+      (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+      return -1;
+    }
+  }
+  if(rc != 0) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    snprintf(err, err_size, "ShadowMountPlus could not mount %s: %s%s",
+             title_id, detail[0] ? detail : "unknown error",
+             rc == EBUSY ? " (close any running game and retry)" : "");
+    gc_log("shadowmount api mount failed title=%s rc=%d detail=%s",
+           title_id, rc, detail);
+    return -1;
+  }
+  *held = 1;
+  gc_log("shadowmount api mount title=%s bound=%d", title_id,
+         system_ex_title_bound_to(title_id, mount_link, NULL, 0, NULL, 0,
+                                  NULL, 0));
+  return 0;
+}
+
+static void
+shadowmount_runtime_release(const char *title_id, int *held) {
+  char detail[256] = {0};
+  int rc;
+
+  if(!*held) return;
+  *held = 0;
+  rc = gc_shadowmount_api_unmount_title(title_id, detail, sizeof(detail));
+  if(rc == 0) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    gc_log("shadowmount api unmount title=%s", title_id);
+    return;
+  }
+  gc_log("shadowmount api unmount failed title=%s rc=%d detail=%s",
+         title_id, rc, detail);
+}
+
+static void
+release_stale_shadowmount_runtime_hold(void) {
+  char title_id[32];
+  char detail[256] = {0};
+  int rc;
+
+  if(read_link_file(GC_SHADOWMOUNT_HOLD_FILE, title_id,
+                    sizeof(title_id)) != 0) {
+    return;
+  }
+  if(!valid_title_id(title_id)) {
+    (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+    return;
+  }
+  if(!shadowmount_on_demand_runtime()) return;
+  rc = gc_shadowmount_api_unmount_title(title_id, detail, sizeof(detail));
+  gc_log("shadowmount stale hold release title=%s rc=%d detail=%s",
+         title_id, rc, detail);
+  // Positive results are API errno values, not successful cleanup.
+  if(rc == 0) (void)unlink(GC_SHADOWMOUNT_HOLD_FILE);
+}
+
 static int
 wait_for_shadowmount_links(const char *title_id,
                            const char *expected_mount_link,
@@ -2989,7 +3130,8 @@ wait_for_shadowmount_links(const char *title_id,
                            char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REMOUNT_WAIT_SECONDS;
   char mount_link[1024];
-  char image_link[1024];
+  char image_link[2048];
+  char image_link_path[1024];
   char actual_type[64];
   char actual_source[1024];
   char actual_mountpoint[1024];
@@ -3012,12 +3154,14 @@ wait_for_shadowmount_links(const char *title_id,
     }
     int has_mount = read_title_link(title_id, "mount.lnk", mount_link,
                                     sizeof(mount_link)) == 0;
-    int has_image = read_title_link(title_id, "mount_img.lnk", image_link,
-                                    sizeof(image_link)) == 0;
+    mount_link_path_for_title(title_id, "mount_img.lnk", image_link_path,
+                              sizeof(image_link_path));
+    int has_image = read_link_file_all(image_link_path, image_link,
+                                       sizeof(image_link)) == 0;
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
+        ? (has_image && link_text_has_line(image_link, expected_image_link))
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
@@ -3026,6 +3170,15 @@ wait_for_shadowmount_links(const char *title_id,
 
     if(mount_ok && image_ok && system_ex_ok) {
       gc_log("shadowmount ready title=%s mount=%s image=%s system_ex=%s:%s",
+             title_id ? title_id : "", mount_link,
+             has_image ? image_link : "",
+             actual_type[0] ? actual_type : "(unknown)",
+             actual_source[0] ? actual_source : "(unknown)");
+      return 0;
+    }
+    if(mount_ok && image_ok && shadowmount_on_demand_runtime()) {
+      gc_log("shadowmount ready title=%s mount=%s image=%s "
+             "system_ex=on-demand:%s:%s",
              title_id ? title_id : "", mount_link,
              has_image ? image_link : "",
              actual_type[0] ? actual_type : "(unknown)",
@@ -3362,7 +3515,7 @@ typedef struct gc_mount_link_backup {
   char mount_link_path[1024];
   char image_link_path[1024];
   char mount_value[1024];
-  char image_value[1024];
+  char image_value[2048];
   int had_mount;
   int had_image;
   int cleared;
@@ -5005,8 +5158,8 @@ prepare_uncompress_plan(gc_game_t *game, int as_image,
 }
 
 static int
-repair_with_wait(const char *title_id, const char *path,
-                 pfs_repair_info_t *info, char *err, size_t err_size) {
+repair_with_wait_mounted(const char *title_id, const char *path,
+                         pfs_repair_info_t *info, char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REPAIR_WAIT_SECONDS;
   gc_checkpoint("repair waiting for mount");
   gc_log("repair wait title=%s path=%s", title_id ? title_id : "",
@@ -5049,10 +5202,25 @@ repair_with_wait(const char *title_id, const char *path,
   }
 }
 
+// Repair reads the nested image through ShadowMountPlus' decompressed PFSC
+// mount, which ShadowMountPlus 1.7+ only keeps while the title is mounted.
 static int
-repair_scan_only_with_wait(const char *title_id, const char *path,
-                           pfs_repair_info_t *info, int *scan_rc_out,
-                           char *err, size_t err_size) {
+repair_with_wait(const char *title_id, const char *path,
+                 pfs_repair_info_t *info, char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = repair_with_wait_mounted(title_id, path, info, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
+}
+
+static int
+repair_scan_only_with_wait_mounted(const char *title_id, const char *path,
+                                   pfs_repair_info_t *info, int *scan_rc_out,
+                                   char *err, size_t err_size) {
   time_t deadline = time(NULL) + GC_REPAIR_WAIT_SECONDS;
   gc_checkpoint("validate-only waiting for mount");
   gc_log("validate-only wait title=%s path=%s", title_id ? title_id : "",
@@ -5097,6 +5265,21 @@ repair_scan_only_with_wait(const char *title_id, const char *path,
 }
 
 static int
+repair_scan_only_with_wait(const char *title_id, const char *path,
+                           pfs_repair_info_t *info, int *scan_rc_out,
+                           char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = repair_scan_only_with_wait_mounted(title_id, path, info, scan_rc_out,
+                                          err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
+}
+
+static int
 post_repair_smoke_verify(const char *title_id, const char *path,
                          pfs_repair_info_t *info, int remount_ready,
                          char *err, size_t err_size) {
@@ -5119,8 +5302,14 @@ post_repair_smoke_verify(const char *title_id, const char *path,
       return -1;
     }
   }
+  int runtime_held = 0;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
   job_set_phase("validating", 0, 0, "Smoke verifying repaired blocks");
-  if(pfs_repair_ffpfsc_smoke_verify(path, info, err, err_size) != 0) {
+  int verify_rc = pfs_repair_ffpfsc_smoke_verify(path, info, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  if(verify_rc != 0) {
     gc_log("repair smoke verify failed title=%s err=%s",
            title_id ? title_id : "", err && err[0] ? err : "unknown");
     return -1;
@@ -6143,8 +6332,8 @@ mount_switch_clear_stale_links(const char *title_id,
       read_link_file(backup->mount_link_path, backup->mount_value,
                      sizeof(backup->mount_value)) == 0;
   backup->had_image =
-      read_link_file(backup->image_link_path, backup->image_value,
-                     sizeof(backup->image_value)) == 0;
+      read_link_file_all(backup->image_link_path, backup->image_value,
+                         sizeof(backup->image_value)) == 0;
 
   if(!backup->had_mount) return 0;
 
@@ -6153,8 +6342,7 @@ mount_switch_clear_stale_links(const char *title_id,
                                           expected_mount);
   image_matches = expected_image && expected_image[0]
       ? (backup->had_image &&
-         paths_equal_ignoring_trailing_slash(backup->image_value,
-                                             expected_image))
+         link_text_has_line(backup->image_value, expected_image))
       : !backup->had_image;
   if(mount_matches && image_matches) return 0;
 
@@ -6515,7 +6703,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
 }
 
 static int
-update_ampr_verify_mounted_hash(const char *title_id,
+update_ampr_verify_mounted_hash_mounted(const char *title_id,
                                 const char *mounted_root,
                                 const char *expected_sha,
                                 char *err, size_t err_size) {
@@ -6544,6 +6732,24 @@ update_ampr_verify_mounted_hash(const char *title_id,
   gc_log("update-ampr mounted verify title=%s path=%s sha=%s",
          title_id ? title_id : "", ampr_path, mounted_sha);
   return 0;
+}
+
+// Link readiness on ShadowMountPlus 1.7 does not keep the image mounted.
+// Hold it for the actual AMPR read, just as validation and smoke verification do.
+static int
+update_ampr_verify_mounted_hash(const char *title_id,
+                                const char *mounted_root,
+                                const char *expected_sha,
+                                char *err, size_t err_size) {
+  int runtime_held = 0;
+  int rc;
+  if(shadowmount_runtime_hold(title_id, &runtime_held, err, err_size) != 0) {
+    return -1;
+  }
+  rc = update_ampr_verify_mounted_hash_mounted(title_id, mounted_root,
+                                               expected_sha, err, err_size);
+  shadowmount_runtime_release(title_id, &runtime_held);
+  return rc;
 }
 
 static int
@@ -7787,6 +7993,7 @@ run_extract_image_op(gc_operation_t *op) {
   uint64_t copied = 0;
   size_t hidden_count = 0;
   int mount_missed = 0;
+  int runtime_held = 0;
 
   gc_checkpoint("extract find game");
   gc_log("extract start op=%s title=%s", op->id, op->title_id);
@@ -7801,8 +8008,7 @@ run_extract_image_op(gc_operation_t *op) {
   }
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s", "image");
-  if(!game.is_mounted || !game.mount_path[0] ||
-     stat(game.mount_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+  if(!game.is_mounted || !game.mount_path[0]) {
     snprintf(op->error, sizeof(op->error), "%s",
              "image must be mounted before extract");
     gc_log("extract failed title=%s err=%s", op->title_id, op->error);
@@ -7857,12 +8063,30 @@ run_extract_image_op(gc_operation_t *op) {
     return -1;
   }
   remove_tree_gc(temp_path);
+  if(shadowmount_runtime_hold(game.title_id, &runtime_held,
+                              err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("extract mount failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(stat(game.mount_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    shadowmount_runtime_release(game.title_id, &runtime_held);
+    snprintf(op->error, sizeof(op->error), "%s",
+             "image must be mounted before extract");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
   append_operation_phase(op, "copying");
   job_set_phase("copying", 0, 0, "Extracting mounted image");
   job_store_u64(&g_job.total_bytes, game.source_size);
   atomic_store(&g_job.copied_bytes, 0);
   gc_checkpoint("extract copy");
-  if(copy_tree_gc(game.mount_path, temp_path, &copied, err, sizeof(err)) != 0) {
+  int copy_rc = copy_tree_gc(game.mount_path, temp_path, &copied,
+                             err, sizeof(err));
+  // Release before the output is registered: a held runtime mount makes
+  // ShadowMountPlus reject the remount below.
+  shadowmount_runtime_release(game.title_id, &runtime_held);
+  if(copy_rc != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "extract failed");
     remove_tree_gc(temp_path);
@@ -8921,7 +9145,7 @@ run_set_read_only_op(gc_operation_t *op) {
 }
 
 static int
-run_read_speed_test_op(gc_operation_t *op) {
+run_read_speed_test_op_held(gc_operation_t *op, int *runtime_held) {
   gc_game_t game = {0};
   gc_read_speed_ctx_t ctx;
   struct stat st;
@@ -8942,6 +9166,14 @@ run_read_speed_test_op(gc_operation_t *op) {
   }
   if(gc_cancel_requested(err, sizeof(err))) {
     snprintf(op->error, sizeof(op->error), "%s", err);
+    return -1;
+  }
+  if(game.is_mounted && game.mount_path[0] &&
+     shadowmount_runtime_hold(game.title_id, runtime_held,
+                              err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("read-speed mount failed title=%s err=%s", op->title_id,
+           op->error);
     return -1;
   }
   if(read_speed_mount_root(&game, read_root, sizeof(read_root),
@@ -9034,6 +9266,14 @@ run_read_speed_test_op(gc_operation_t *op) {
          (unsigned long long)ctx.files_opened);
   free(ctx.buf);
   return 0;
+}
+
+static int
+run_read_speed_test_op(gc_operation_t *op) {
+  int runtime_held = 0;
+  int rc = run_read_speed_test_op_held(op, &runtime_held);
+  shadowmount_runtime_release(op->title_id, &runtime_held);
+  return rc;
 }
 
 static int
@@ -12207,6 +12447,7 @@ void
 gc_api_recover_on_startup(void) {
   cleanup_force_remount_temps_on_startup();
   cleanup_delete_pending_temps_on_startup();
+  release_stale_shadowmount_runtime_hold();
   mount_switch_restore_recovery_log();
   recover_interrupted_history(GC_HISTORY_LOG);
 }

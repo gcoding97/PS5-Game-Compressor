@@ -45,6 +45,9 @@
 #define SHADOWMOUNT_AUTOLOADER_DIR "/data/ps5_autoloader"
 #define PAYLOAD_MANAGER_PORT 8084
 #define LOCAL_HTTP_TIMEOUT_SECONDS 5
+#define SHADOWMOUNT_API_DEFAULT_PORT 10101
+// Mounting attaches the image and can take a while on large or USB images.
+#define SHADOWMOUNT_API_TIMEOUT_SECONDS 120
 #define SHADOWMOUNT_PFSC_SECTOR 65536U
 
 int sceKernelLoadStartModule(const char *, size_t, const void *, uint32_t,
@@ -1331,6 +1334,168 @@ payload_manager_launch(const char *elf_path, char *detail, size_t detail_size) {
              status, elf_path ? elf_path : "");
   }
   return 0;
+}
+
+static int
+shadowmount_config_value(const char *key, char *out, size_t out_size) {
+  FILE *f = fopen(SHADOWMOUNT_CONFIG, "r");
+  char line[512];
+  int found = 0;
+  if(!f) return 0;
+  while(fgets(line, sizeof(line), f)) {
+    char *s = trim_left(line);
+    char *eq;
+    if(*s == '#' || *s == ';' || !(eq = strchr(s, '='))) continue;
+    *eq = 0;
+    trim_right(s);
+    if(strcasecmp(s, key) != 0) continue;
+    s = trim_left(eq + 1);
+    trim_right(s);
+    snprintf(out, out_size, "%s", s);
+    found = 1;
+  }
+  fclose(f);
+  return found;
+}
+
+static int
+shadowmount_api_endpoint(struct sockaddr_in *addr, char *detail,
+                         size_t detail_size) {
+  char value[128];
+  long port = SHADOWMOUNT_API_DEFAULT_PORT;
+  memset(addr, 0, sizeof(*addr));
+  addr->sin_family = AF_INET;
+  addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if(shadowmount_config_value("api_enabled", value, sizeof(value)) &&
+     (!strcmp(value, "0") || !strcasecmp(value, "false") ||
+      !strcasecmp(value, "no") || !strcasecmp(value, "off"))) {
+    set_detail(detail, detail_size,
+               "ShadowMountPlus API is disabled (api_enabled=0)");
+    return -1;
+  }
+  if(shadowmount_config_value("api_port", value, sizeof(value))) {
+    char *end = NULL;
+    port = strtol(value, &end, 10);
+    if(!end || *end || port < 1 || port > 65535) {
+      port = SHADOWMOUNT_API_DEFAULT_PORT;
+    }
+  }
+  addr->sin_port = htons((uint16_t)port);
+  // A listener bound to one LAN address is not reachable on loopback.
+  if(shadowmount_config_value("api_bind_address", value, sizeof(value)) &&
+     value[0] && strcmp(value, "0.0.0.0") != 0) {
+    struct in_addr bind_addr;
+    if(inet_pton(AF_INET, value, &bind_addr) == 1) {
+      addr->sin_addr = bind_addr;
+    }
+  }
+  return 0;
+}
+
+// Returns 0 on success, the ShadowMountPlus errno status (> 0) when the API
+// rejected the request, or -1 when the API could not be reached.
+static int
+shadowmount_api_post(const char *route, const char *body,
+                     char *detail, size_t detail_size) {
+  struct sockaddr_in addr;
+  struct timeval timeout;
+  char request[1024];
+  char response[4096];
+  size_t used = 0;
+  int http_status = 0;
+  int status = -1;
+  const char *p;
+  int fd;
+  int n;
+
+  if(detail && detail_size) detail[0] = 0;
+  if(shadowmount_api_endpoint(&addr, detail, detail_size) != 0) return -1;
+  n = snprintf(request, sizeof(request),
+               "POST %s HTTP/1.1\r\n"
+               "Host: 127.0.0.1\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %zu\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "%s",
+               route, strlen(body), body);
+  if(n < 0 || (size_t)n >= sizeof(request)) {
+    set_detail(detail, detail_size, "ShadowMountPlus API request too long");
+    return -1;
+  }
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if(fd < 0) {
+    set_detail_errno(detail, detail_size, "ShadowMountPlus API socket");
+    return -1;
+  }
+  timeout.tv_sec = SHADOWMOUNT_API_TIMEOUT_SECONDS;
+  timeout.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    set_detail_errno(detail, detail_size, "connect ShadowMountPlus API");
+    close(fd);
+    return -1;
+  }
+  if(local_send_all(fd, request, (size_t)n) != 0) {
+    set_detail_errno(detail, detail_size, "send ShadowMountPlus API request");
+    close(fd);
+    return -1;
+  }
+  while(used + 1 < sizeof(response)) {
+    ssize_t got = recv(fd, response + used, sizeof(response) - 1 - used, 0);
+    if(got < 0 && errno == EINTR) continue;
+    if(got <= 0) break;
+    used += (size_t)got;
+  }
+  close(fd);
+  response[used] = 0;
+  if(sscanf(response, "HTTP/%*s %d", &http_status) != 1) {
+    snprintf(detail, detail_size, "ShadowMountPlus API bad response: %.120s",
+             response);
+    return -1;
+  }
+  p = strstr(response, "\r\n\r\n");
+  p = p ? strstr(p, "\"status\":") : NULL;
+  if(p) status = (int)strtol(p + strlen("\"status\":"), NULL, 10);
+  if(http_status < 400 && status == 0) return 0;
+  if(status <= 0) status = EIO;
+  p = strstr(response, "\"error\":\"");
+  if(p) {
+    p += strlen("\"error\":\"");
+    snprintf(detail, detail_size, "HTTP %d: %.*s", http_status,
+             (int)strcspn(p, "\""), p);
+  } else {
+    snprintf(detail, detail_size, "HTTP %d: %s", http_status,
+             strerror(status));
+  }
+  return status;
+}
+
+static int
+shadowmount_api_title_request(const char *route, const char *title_id,
+                              char *detail, size_t detail_size) {
+  char body[64];
+  if(!shadowmount_title_id_valid(title_id)) {
+    set_detail(detail, detail_size, "bad title id");
+    return EINVAL;
+  }
+  snprintf(body, sizeof(body), "{\"title_id\":\"%s\"}", title_id);
+  return shadowmount_api_post(route, body, detail, detail_size);
+}
+
+int
+gc_shadowmount_api_mount_title(const char *title_id,
+                               char *detail, size_t detail_size) {
+  return shadowmount_api_title_request("/api/v1/games/mount", title_id,
+                                       detail, detail_size);
+}
+
+int
+gc_shadowmount_api_unmount_title(const char *title_id,
+                                 char *detail, size_t detail_size) {
+  return shadowmount_api_title_request("/api/v1/games/unmount", title_id,
+                                       detail, detail_size);
 }
 
 int
