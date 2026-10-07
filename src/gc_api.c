@@ -26,6 +26,7 @@
 #include "gc_icon_thumb.h"
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
+#include "gc_shadowmount_api.h"
 #include "gc_size_cache.h"
 #include "pfs_ampr_hotswap.h"
 #include "pfs_compress.h"
@@ -559,6 +560,53 @@ read_link_file(const char *path, char *out, size_t out_size) {
   return out[0] ? 0 : -1;
 }
 
+/* ShadowMountPlus 1.7 may store one path per image layer in this file. */
+static int
+read_link_file_all(const char *path, char *out, size_t out_size) {
+  FILE *f;
+  size_t len = 0;
+
+  if(!out || out_size < 2) return -1;
+  out[0] = 0;
+  f = fopen(path, "r");
+  if(!f) return -1;
+  while(len < out_size - 1) {
+    size_t n = fread(out + len, 1, out_size - 1 - len, f);
+    len += n;
+    if(n == 0) break;
+  }
+  if(ferror(f) || !feof(f)) {
+    fclose(f);
+    out[0] = 0;
+    return -1;
+  }
+  fclose(f);
+  out[len] = 0;
+  while(len > 0 && (out[len - 1] == '\r' || out[len - 1] == '\n')) {
+    out[--len] = 0;
+  }
+  return len > 0 ? 0 : -1;
+}
+
+static int
+link_text_has_line(const char *text, const char *expected) {
+  size_t expected_len;
+  const char *line;
+
+  if(!text || !expected || !expected[0]) return 0;
+  expected_len = strlen(expected);
+  line = text;
+  while(*line) {
+    const char *end = strchr(line, '\n');
+    size_t len = end ? (size_t)(end - line) : strlen(line);
+    while(len > 0 && line[len - 1] == '\r') len--;
+    if(len == expected_len && memcmp(line, expected, len) == 0) return 1;
+    if(!end) break;
+    line = end + 1;
+  }
+  return 0;
+}
+
 static int
 ampr_folder_target_probe(const char *root, char *path_out, size_t path_size,
                          char sha_out[65]) {
@@ -625,6 +673,14 @@ read_title_link(const char *title_id, const char *name,
   char path[1024];
   mount_link_path_for_title(title_id, name, path, sizeof(path));
   return read_link_file(path, out, out_size);
+}
+
+static int
+read_title_link_all(const char *title_id, const char *name,
+                    char *out, size_t out_size) {
+  char path[1024];
+  mount_link_path_for_title(title_id, name, path, sizeof(path));
+  return read_link_file_all(path, out, out_size);
 }
 
 static int
@@ -818,6 +874,33 @@ strip_extension_base(const char *path, char *out, size_t out_size) {
   memcpy(out, name, len);
   out[len] = 0;
   return 0;
+}
+
+/*
+ * ShadowMountPlus may name the generated wrapper after the nested app image,
+ * e.g. PPSA23732-app0.ffpfsc, instead of using the bare title ID.  Keep the
+ * match strict: accept the exact title or the title followed by a suffix
+ * separator, but never an unrelated title that merely shares a prefix.
+ */
+static int
+ffpfsc_title_id_from_name(const char *name, char *out, size_t out_size) {
+  char stem[256];
+  size_t title_len = 9;
+
+  if(!name || !out || out_size == 0 ||
+     strip_extension_base(name, stem, sizeof(stem)) != 0) {
+    return -1;
+  }
+  if(valid_title_id(stem)) {
+    if(strlen(stem) >= out_size) return -1;
+    snprintf(out, out_size, "%s", stem);
+    return 0;
+  }
+  if(strlen(stem) <= title_len + 1 || stem[title_len] != '-') return -1;
+  if(title_len >= out_size) return -1;
+  memcpy(out, stem, title_len);
+  out[title_len] = 0;
+  return valid_title_id(out) ? 0 : -1;
 }
 
 static int
@@ -1516,16 +1599,34 @@ static int
 find_outer_pfsc_candidate(const char *root, const char *title_id,
                           uint32_t shadow_hash, char *out,
                           size_t out_size) {
-  char candidate[1024];
+  DIR *d;
+  struct dirent *ent;
   struct stat st;
-  int n;
-  if(!root || !title_id || !out) return -1;
-  n = snprintf(candidate, sizeof(candidate), "%s/%s.ffpfsc", root, title_id);
-  if(n < 0 || (size_t)n >= sizeof(candidate)) return -1;
-  if(fnv1a32_string(candidate) != shadow_hash) return -1;
-  if(stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
-  snprintf(out, out_size, "%s", candidate);
-  return 0;
+  if(!root || !title_id || !out || out_size == 0) return -1;
+  d = opendir(root);
+  if(!d) return -1;
+  while((ent = readdir(d))) {
+    char candidate[1024];
+    char candidate_title[64];
+    int n;
+    if(!ffpfsc_title_id_from_name(ent->d_name, candidate_title,
+                                  sizeof(candidate_title)) ||
+       strcmp(candidate_title, title_id)) {
+      continue;
+    }
+    n = snprintf(candidate, sizeof(candidate), "%s/%s", root, ent->d_name);
+    if(n < 0 || (size_t)n >= sizeof(candidate)) continue;
+    if(fnv1a32_string(candidate) != shadow_hash) continue;
+    if(stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    if(snprintf(out, out_size, "%s", candidate) >= (int)out_size) {
+      closedir(d);
+      return -1;
+    }
+    closedir(d);
+    return 0;
+  }
+  closedir(d);
+  return -1;
 }
 
 static int
@@ -1544,23 +1645,101 @@ find_outer_pfsc_by_shadow_hash(const char *title_id, uint32_t shadow_hash,
 
 static int
 find_exact_pfsc_by_title(const char *title_id, char *out, size_t out_size) {
-  char candidate[1024];
   char err[256] = {0};
-  struct stat st;
   gc_source_roots_t roots;
   if(!valid_title_id(title_id) || !out || out_size == 0) return -1;
   shadow_source_roots_build(&roots);
   for(size_t i = 0; i < roots.count; i++) {
-    int n = snprintf(candidate, sizeof(candidate), "%s/%s.ffpfsc",
-                     roots.roots[i], title_id);
-    if(n < 0 || (size_t)n >= sizeof(candidate)) continue;
-    if(stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-    pfs_decompress_info_t info = {0};
-    err[0] = 0;
-    if(pfs_decompress_probe(candidate, &info, err, sizeof(err)) != 0) {
-      continue;
+    DIR *d = opendir(roots.roots[i]);
+    struct dirent *ent;
+    if(!d) continue;
+    while((ent = readdir(d))) {
+      char candidate[1024];
+      char candidate_title[64];
+      struct stat st;
+      int n;
+      if(!ffpfsc_title_id_from_name(ent->d_name, candidate_title,
+                                    sizeof(candidate_title)) ||
+         strcmp(candidate_title, title_id)) {
+        continue;
+      }
+      n = snprintf(candidate, sizeof(candidate), "%s/%s", roots.roots[i],
+                   ent->d_name);
+      if(n < 0 || (size_t)n >= sizeof(candidate) ||
+         stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) {
+        continue;
+      }
+      pfs_decompress_info_t info = {0};
+      err[0] = 0;
+      if(pfs_decompress_probe(candidate, &info, err, sizeof(err)) != 0) {
+        continue;
+      }
+      if(snprintf(out, out_size, "%s", candidate) >= (int)out_size) {
+        closedir(d);
+        return -1;
+      }
+      closedir(d);
+      return 0;
     }
-    snprintf(out, out_size, "%s", candidate);
+    closedir(d);
+  }
+  return -1;
+}
+
+/* Resolve the usable image path from ShadowMountPlus' multi-line link. */
+static int
+read_title_image_source_link(const char *title_id, char *out,
+                             size_t out_size) {
+  char path[1024];
+  char text[4096];
+  char fallback[1024] = {0};
+  const char *line;
+
+  if(!title_id || !out || out_size == 0) return -1;
+  mount_link_path_for_title(title_id, "mount_img.lnk", path, sizeof(path));
+  if(read_link_file_all(path, text, sizeof(text)) != 0) return -1;
+
+  line = text;
+  while(*line) {
+    const char *end = strchr(line, '\n');
+    size_t len = end ? (size_t)(end - line) : strlen(line);
+    while(len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ' ||
+                      line[len - 1] == '\t')) len--;
+    while(len > 0 && (*line == ' ' || *line == '\t')) {
+      line++;
+      len--;
+    }
+    if(len > 0 && len < sizeof(fallback)) {
+      char candidate[1024];
+      struct stat st;
+      char err[128] = {0};
+      uint32_t shadow_hash = 0;
+      snprintf(candidate, sizeof(candidate), "%.*s", (int)len, line);
+      if(!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", candidate);
+      if(ends_with_ci(candidate, ".ffpfsc") &&
+         pfs_decompress_probe(candidate, NULL, err, sizeof(err)) == 0) {
+        snprintf(out, out_size, "%s", candidate);
+        return 0;
+      }
+      if(shadow_pfsc_hash_from_path(candidate, title_id, &shadow_hash) == 0) {
+        char outer[1024];
+        if(find_outer_pfsc_by_shadow_hash(title_id, shadow_hash, outer,
+                                          sizeof(outer)) == 0) {
+          snprintf(out, out_size, "%s", candidate);
+          return 0;
+        }
+      }
+      if(stat(candidate, &st) == 0 && S_ISREG(st.st_mode) &&
+         pfs_image_probe(candidate, NULL, err, sizeof(err)) == 0) {
+        snprintf(out, out_size, "%s", candidate);
+        return 0;
+      }
+    }
+    if(!end) break;
+    line = end + 1;
+  }
+  if(fallback[0]) {
+    snprintf(out, out_size, "%s", fallback);
     return 0;
   }
   return -1;
@@ -2972,14 +3151,30 @@ system_ex_title_bound_to(const char *title_id,
   }
 
   if(stat(eboot, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
-  if(!statfs_ok) return 0;
-  if(strcmp(fs.f_fstypename, "nullfs") != 0) return 0;
-  if(expected_mount_source && expected_mount_source[0] &&
-     !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
-                                          expected_mount_source)) {
+  if(!expected_mount_source || !expected_mount_source[0]) return 0;
+  if(statfs_ok &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntonname, mountpoint) &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
+                                         expected_mount_source)) {
+    return 1;
+  }
+  if(statfs_ok &&
+     paths_equal_ignoring_trailing_slash(fs.f_mntonname, mountpoint)) {
     return 0;
   }
-  return 1;
+  /* statfs can report the image filesystem below ShadowMountPlus' nullfs. */
+  struct statfs *mounts = NULL;
+  int mount_count = getmntinfo(&mounts, MNT_NOWAIT);
+  for(int i = 0; i < mount_count; i++) {
+    if(strcmp(mounts[i].f_fstypename, "nullfs") == 0 &&
+       paths_equal_ignoring_trailing_slash(mounts[i].f_mntonname,
+                                           mountpoint) &&
+       paths_equal_ignoring_trailing_slash(mounts[i].f_mntfromname,
+                                           expected_mount_source)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static int
@@ -3012,12 +3207,12 @@ wait_for_shadowmount_links(const char *title_id,
     }
     int has_mount = read_title_link(title_id, "mount.lnk", mount_link,
                                     sizeof(mount_link)) == 0;
-    int has_image = read_title_link(title_id, "mount_img.lnk", image_link,
-                                    sizeof(image_link)) == 0;
+    int has_image = read_title_link_all(title_id, "mount_img.lnk", image_link,
+                                        sizeof(image_link)) == 0;
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
+        ? (has_image && link_text_has_line(image_link, expected_image_link))
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
@@ -3577,7 +3772,7 @@ candidate_game_from_path(const char *source_path, const char *name,
   if(strstr(name, GC_FORCE_REMOUNT_PREFIX)) return -1;
 
   if(S_ISREG(st.st_mode) && ends_with_ci(name, ".ffpfsc")) {
-    if(strip_extension_base(name, title_id, sizeof(title_id)) != 0 ||
+    if(ffpfsc_title_id_from_name(name, title_id, sizeof(title_id)) != 0 ||
        !valid_title_id(title_id)) {
       return -1;
     }
@@ -3738,9 +3933,8 @@ discover_games_ex(gc_game_t *games, size_t max_games, size_t *count_out,
         }
         snprintf(g->mount_path, sizeof(g->mount_path), "%s", g->image_path);
       } else {
-        snprintf(link_path, sizeof(link_path), "%s/%s/mount_img.lnk",
-                 GC_APP_BASE, g->title_id);
-        (void)read_link_file(link_path, g->image_path, sizeof(g->image_path));
+        (void)read_title_image_source_link(g->title_id, g->image_path,
+                                           sizeof(g->image_path));
       }
       if(game_uses_system_app_path(g)) continue;
       set_game_mount_status(g, has_mount_link,
@@ -3863,7 +4057,7 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
   set_game_mount_status(&candidate, 0, "not-mounted");
 
   if(S_ISREG(st.st_mode) && ends_with_ci(name, ".ffpfsc")) {
-    if(strip_extension_base(name, title_id, sizeof(title_id)) != 0 ||
+    if(ffpfsc_title_id_from_name(name, title_id, sizeof(title_id)) != 0 ||
        strcmp(title_id, op->title_id) ||
        pfs_decompress_detect_nested(op->source_path, &dec,
                                     err, sizeof(err)) != 0) {
@@ -3933,10 +4127,8 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
              op->title_id);
     if(read_link_file(link_path, mounted.mount_path,
                       sizeof(mounted.mount_path)) == 0) {
-      snprintf(link_path, sizeof(link_path), "%s/%s/mount_img.lnk",
-               GC_APP_BASE, op->title_id);
-      (void)read_link_file(link_path, mounted.image_path,
-                           sizeof(mounted.image_path));
+      (void)read_title_image_source_link(op->title_id, mounted.image_path,
+                                         sizeof(mounted.image_path));
       set_game_mount_status(&mounted, 1, "mounted");
       detect_game_source_ex(&mounted, 0, 0);
       if(game_source_matches(&mounted, candidate.source_path)) {
@@ -5157,6 +5349,11 @@ build_force_remount_temp_path(const char *path, const char *title_id,
 }
 
 static int
+shadowmount_api_mount_selected_source(const char *title_id,
+                                      const char *source_path,
+                                      char *err, size_t err_size);
+
+static int
 wait_for_compressed_shadowmount(const char *title_id, const char *path,
                                 const char *nested_name, int nested_type,
                                 const char *current,
@@ -5218,6 +5415,16 @@ force_compressed_path_bounce_remount(const char *title_id,
   int cancelled = 0;
 
   if(gc_cancel_requested(err, err_size)) return -1;
+  {
+    char api_err[256] = {0};
+    int api_ready = gc_shadowmount_api_available() ||
+        gc_shadowmount_api_probe(NULL, api_err, sizeof(api_err)) == 0;
+    if(api_ready) {
+      job_set_phase("mounting", 0, 0, "Remounting with ShadowMountPlus");
+      return shadowmount_api_mount_selected_source(title_id, original_path,
+                                                    err, err_size);
+    }
+  }
   if(build_force_remount_temp_path(original_path, title_id, temp_path,
                                    sizeof(temp_path)) != 0) {
     snprintf(err, err_size, "%s", "could not build compressed remount temp path");
@@ -6078,6 +6285,126 @@ move_remount_expectations(const gc_game_t *game, const char *target_path,
 }
 
 static int
+shadowmount_api_wait_until_unmounted(char *err, size_t err_size) {
+  for(int attempt = 0; attempt < 20; attempt++) {
+    char mounted_title[GC_SM_TITLE_ID_LEN] = {0};
+    char api_err[256] = {0};
+    int found = gc_shadowmount_api_find_mounted_game(
+        mounted_title, sizeof(mounted_title), api_err, sizeof(api_err));
+    if(found == 0) return 0;
+    if(found < 0) {
+      snprintf(err, err_size, "ShadowMount API mount query: %s",
+               api_err[0] ? api_err : "unknown error");
+      return -1;
+    }
+    usleep(500000);
+  }
+  snprintf(err, err_size, "%s",
+           "ShadowMount API did not release the previous mount");
+  return -1;
+}
+
+static int
+shadowmount_api_wait_for_selected_game(const char *title_id,
+                                       const char *source_path,
+                                       int require_mounted,
+                                       char *err, size_t err_size) {
+  struct stat source_stat;
+  int have_source_stat = stat(source_path, &source_stat) == 0;
+  char observed_path[GC_SM_PATH_LEN] = {0};
+  int observed_image_ready = 0;
+  int observed_mounted = 0;
+  for(int attempt = 0; attempt < 120; attempt++) {
+    gc_sm_game_t game = {0};
+    gc_sm_image_t image = {0};
+    char api_err[256] = {0};
+    int image_ok = gc_shadowmount_api_find_image(
+        source_path, &image, api_err, sizeof(api_err)) == 1 &&
+        image.complete && image.source_available &&
+        (!have_source_stat || image.mtime_sec == (long long)source_stat.st_mtime);
+    int game_ok = 0;
+    observed_image_ready = image_ok;
+    if(image_ok && gc_shadowmount_api_get_game_info(
+        title_id, &game, api_err, sizeof(api_err)) == 0) {
+      snprintf(observed_path, sizeof(observed_path), "%s", game.path);
+      observed_mounted = game.mounted;
+      game_ok = strcmp(game.path, source_path) == 0;
+    }
+    if(game_ok && image_ok && (!require_mounted || observed_mounted)) return 0;
+    usleep(500000);
+  }
+  gc_log("shadowmount api source timeout title=%s expected=%s actual=%s "
+         "imageReady=%d mounted=%d requireMounted=%d",
+         title_id, source_path, observed_path[0] ? observed_path : "(unknown)",
+         observed_image_ready, observed_mounted, require_mounted);
+  snprintf(err, err_size, "ShadowMount API did not %s %s (image=%d mounted=%d)",
+           require_mounted ? "mount" : "register", title_id,
+           observed_image_ready, observed_mounted);
+  return -1;
+}
+
+static int
+shadowmount_api_mount_selected_source(const char *title_id,
+                                      const char *source_path,
+                                      char *err, size_t err_size) {
+  char mounted_title[GC_SM_TITLE_ID_LEN] = {0};
+  char api_err[256] = {0};
+  gc_sm_game_t old_game = {0};
+  size_t path_len;
+  int mounted;
+
+  if(!valid_title_id(title_id) || !source_path || source_path[0] != '/') {
+    snprintf(err, err_size, "%s", "ShadowMount API source is unavailable");
+    return -1;
+  }
+  path_len = strlen(source_path);
+  if(path_len < 7 || strcasecmp(source_path + path_len - 7, ".ffpfsc") != 0) {
+    snprintf(err, err_size, "%s", "ShadowMount API requires a compressed image");
+    return -1;
+  }
+
+  mounted = gc_shadowmount_api_find_mounted_game(
+      mounted_title, sizeof(mounted_title), api_err, sizeof(api_err));
+  if(mounted < 0) {
+    snprintf(err, err_size, "ShadowMount API mount query: %s",
+             api_err[0] ? api_err : "unknown error");
+    return -1;
+  }
+  if(mounted > 0 &&
+     gc_shadowmount_api_unmount_game(mounted_title, err, err_size) != 0) {
+    return -1;
+  }
+  if(shadowmount_api_wait_until_unmounted(err, err_size) != 0) return -1;
+
+  if(gc_shadowmount_api_get_game_info(title_id, &old_game,
+                                      api_err, sizeof(api_err)) == 0 &&
+     old_game.path[0] && strcmp(old_game.path, source_path) != 0) {
+    char remove_err[256] = {0};
+    if(gc_shadowmount_api_remove_manual_source(old_game.path, NULL,
+                                               remove_err,
+                                               sizeof(remove_err)) != 0) {
+      gc_log("shadowmount api old source removal title=%s path=%s err=%s",
+             title_id, old_game.path,
+             remove_err[0] ? remove_err : "unknown");
+    }
+  }
+  if(gc_shadowmount_api_add_manual_source(source_path, NULL,
+                                          err, err_size) != 0 ||
+     gc_shadowmount_api_scan(err, err_size) != 0) {
+    return -1;
+  }
+  if(shadowmount_api_wait_for_selected_game(title_id, source_path, 0,
+                                            err, err_size) != 0) return -1;
+  if(gc_shadowmount_api_mount_game_mode(title_id, "ro", err, err_size) != 0) {
+    return -1;
+  }
+  if(shadowmount_api_wait_for_selected_game(title_id, source_path, 1,
+                                            err, err_size) != 0) return -1;
+  gc_log("shadowmount api mounted title=%s source=%s", title_id, source_path);
+  return 0;
+}
+
+static int
 write_title_link_file(const char *path, const char *value,
                       char *err, size_t err_size) {
   int fd;
@@ -6354,6 +6681,7 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
   char expected_image[1024] = {0};
   char scan_err[256] = {0};
   gc_mount_link_backup_t link_backup;
+  int use_sm_api = 0;
 
   memset(&link_backup, 0, sizeof(link_backup));
   if(hidden_count) *hidden_count = 0;
@@ -6375,6 +6703,14 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
     return -1;
   }
   if(gc_cancel_requested(err, err_size)) return -1;
+  if(selected->source_kind == GC_SOURCE_COMPRESSED) {
+    char api_err[256] = {0};
+    use_sm_api = gc_shadowmount_api_available() ||
+        gc_shadowmount_api_probe(NULL, api_err, sizeof(api_err)) == 0;
+    gc_log("shadowmount compressed mount backend title=%s backend=%s detail=%s",
+           op->title_id, use_sm_api ? "api" : "legacy",
+           use_sm_api ? "available" : (api_err[0] ? api_err : "unavailable"));
+  }
 
   gc_checkpoint("mount selected hide competitors");
   append_operation_phase(op, "hiding");
@@ -6386,6 +6722,13 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
   }
   artifact_cache_invalidate();
   if(gc_cancel_requested(err, err_size)) return -1;
+  if(use_sm_api) {
+    gc_checkpoint("mount selected via ShadowMount API");
+    append_operation_phase(op, "mounting");
+    job_set_phase("mounting", 0, 0, "Mounting with ShadowMountPlus");
+    return shadowmount_api_mount_selected_source(
+        selected->title_id, selected->source_path, err, err_size);
+  }
   if(mount_switch_clear_stale_links(op->title_id, expected_mount,
                                     expected_image, &link_backup,
                                     err, err_size) != 0) {

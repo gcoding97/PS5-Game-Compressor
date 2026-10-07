@@ -186,7 +186,7 @@ status_request(const http_request_t *req) {
 #ifdef GAME_COMPRESSOR_VERSION
                    GAME_COMPRESSOR_VERSION,
 #else
-                   "dev",
+                   "1.1.1-fpf-api-remount-fix",
 #endif
                    (long)getpid(), uptime,
 #ifdef GAME_COMPRESSOR_PORT

@@ -161,26 +161,6 @@ hs_set_err(char *err, size_t err_size, const char *fmt, ...) {
   va_end(ap);
 }
 
-static int
-hs_exfat_require_contiguous_allocation(const hs_exfat_file_t *file,
-                                       const char *label,
-                                       char *err, size_t err_size) {
-  if(!file) {
-    hs_set_err(err, err_size, "bad exFAT allocation check");
-    errno = EINVAL;
-    return -1;
-  }
-  if(file->first_cluster && file->allocated_clusters &&
-     (file->stream_flags & 0x02U) == 0) {
-    hs_set_err(err, err_size,
-               "%s uses a fragmented exFAT allocation; recompress with AMPR hot-swap layout",
-               label ? label : "target file");
-    errno = EINVAL;
-    return -1;
-  }
-  return 0;
-}
-
 static uint16_t
 hs_rd16(const unsigned char *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -1295,6 +1275,60 @@ hs_append_fat_entry_patch(const hs_exfat_t *ex, hs_patch_list_t *patches,
 }
 
 static int
+hs_exfat_release_file_allocation(const hs_exfat_t *ex,
+                                 const hs_exfat_file_t *file,
+                                 unsigned char *bitmap,
+                                 hs_patch_list_t *patches,
+                                 char *err, size_t err_size) {
+  if(!ex || !file || !bitmap) {
+    hs_set_err(err, err_size, "bad exFAT allocation release");
+    errno = EINVAL;
+    return -1;
+  }
+  if(!file->first_cluster || !file->allocated_clusters) return 0;
+
+  if(file->stream_flags & 0x02U) {
+    for(uint32_t i = 0; i < file->allocated_clusters; i++) {
+      hs_bitmap_set(bitmap, file->first_cluster + i, 0);
+    }
+    return hs_append_fat_range_patch(ex, patches, file->first_cluster,
+                                     file->allocated_clusters, 1,
+                                     err, err_size);
+  }
+
+  uint32_t cluster = file->first_cluster;
+  for(uint32_t i = 0; i < file->allocated_clusters; i++) {
+    uint32_t next = 0;
+    if(hs_exfat_check_cluster(ex, cluster, err, err_size) != 0 ||
+       hs_exfat_read_fat(ex, cluster, &next, err, err_size) != 0 ||
+       hs_append_fat_entry_patch(ex, patches, cluster, 0,
+                                 err, err_size) != 0) {
+      return -1;
+    }
+    hs_bitmap_set(bitmap, cluster, 0);
+    if(next >= 0xfffffff8U || next == 0xffffffffU) {
+      if(i + 1U != file->allocated_clusters) {
+        hs_set_err(err, err_size, "fragmented exFAT allocation ended early");
+        errno = EINVAL;
+        return -1;
+      }
+      return 0;
+    }
+    if(next < 2 || (uint64_t)next - 2ULL >= ex->cluster_count ||
+       next == cluster) {
+      hs_set_err(err, err_size, "invalid fragmented exFAT allocation chain");
+      errno = EINVAL;
+      return -1;
+    }
+    cluster = next;
+  }
+
+  hs_set_err(err, err_size, "fragmented exFAT allocation is too long");
+  errno = EINVAL;
+  return -1;
+}
+
+static int
 hs_exfat_chain_last(const hs_exfat_t *ex, uint32_t first_cluster,
                     uint32_t *last_out, uint32_t *count_out,
                     char *err, size_t err_size) {
@@ -1630,11 +1664,6 @@ hs_build_exfat_index_patches(hs_exfat_t *ex, hs_patch_list_t *patches,
      hs_exfat_load_root_bitmap(ex, err, err_size) != 0) {
     goto done;
   }
-  if(slot.found_existing &&
-     hs_exfat_require_contiguous_allocation(&slot.existing, "ampr_emu.index",
-                                            err, err_size) != 0) {
-    goto done;
-  }
   root_extra = (!slot.found_existing && slot.needs_root_extend) ? 1U : 0U;
   uint64_t bitmap_bytes64 = hs_ceil_div_u64(ex->cluster_count, 8);
   if(ex->bitmap_size < bitmap_bytes64 || ex->bitmap_size > SIZE_MAX) {
@@ -1652,13 +1681,6 @@ hs_build_exfat_index_patches(hs_exfat_t *ex, hs_patch_list_t *patches,
   if(ex->read_fn(ex->read_ctx, bitmap_off, bitmap, (size_t)ex->bitmap_size,
                  err, err_size) != 0) {
     goto done;
-  }
-  if(slot.found_existing &&
-     slot.existing.first_cluster &&
-     slot.existing.allocated_clusters) {
-    for(uint32_t i = 0; i < slot.existing.allocated_clusters; i++) {
-      hs_bitmap_set(bitmap, slot.existing.first_cluster + i, 0);
-    }
   }
   if(root_extra && needed_clusters >= UINT32_MAX) {
     hs_set_err(err, err_size, "AMPR index allocation is too large");
@@ -1690,6 +1712,17 @@ hs_build_exfat_index_patches(hs_exfat_t *ex, hs_patch_list_t *patches,
     hs_bitmap_set(bitmap, run_first + i, 1);
   }
 
+  /*
+   * Keep the old allocation marked while looking for the replacement run.
+   * This prevents a tail run from overlapping the old file and makes it
+   * safe to release either a NoFatChain allocation or a real FAT chain here.
+   */
+  if(slot.found_existing &&
+     hs_exfat_release_file_allocation(ex, &slot.existing, bitmap, patches,
+                                      err, err_size) != 0) {
+    goto done;
+  }
+
   unsigned char entry_set[32 * 19];
   size_t entry_count = 0;
   if(hs_exfat_make_file_entry_set("ampr_emu.index", new_first,
@@ -1705,12 +1738,6 @@ hs_build_exfat_index_patches(hs_exfat_t *ex, hs_patch_list_t *patches,
                                  err, err_size) != 0)) ||
      hs_append_fat_range_patch(ex, patches, new_first, new_alloc, 0,
                                err, err_size) != 0 ||
-     (slot.found_existing &&
-      slot.existing.first_cluster &&
-      slot.existing.allocated_clusters &&
-      hs_append_fat_range_patch(ex, patches, slot.existing.first_cluster,
-                                slot.existing.allocated_clusters, 1,
-                                err, err_size) != 0) ||
      hs_patch_append(patches, bitmap_off, bitmap, (size_t)ex->bitmap_size,
                      err, err_size) != 0 ||
      hs_append_data_patch(ex, patches, new_first, index_data, index_size,
@@ -1808,18 +1835,15 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
   }
   uint32_t needed_clusters = (uint32_t)needed_clusters64;
   if(hs_exfat_find_ampr(ex, &file, err, err_size) != 0) return -1;
-  if(hs_exfat_require_contiguous_allocation(&file, "AMPR binary",
-                                            err, err_size) != 0) {
-    return -1;
-  }
 
   uint32_t new_first = file.first_cluster;
   uint32_t new_alloc = file.allocated_clusters;
   int tail_migrated = 0;
-  unsigned char *bitmap_final = NULL;
+  unsigned char *bitmap = NULL;
   uint64_t bitmap_off = 0;
 
-  if(needed_clusters > file.allocated_clusters) {
+  if((file.stream_flags & 0x02U) == 0 ||
+     needed_clusters > file.allocated_clusters) {
     if(hs_exfat_load_root_bitmap(ex, err, err_size) != 0) return -1;
     uint64_t bitmap_bytes64 = hs_ceil_div_u64(ex->cluster_count, 8);
     if(ex->bitmap_size < bitmap_bytes64 || ex->bitmap_size > SIZE_MAX) {
@@ -1827,7 +1851,7 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
       errno = EINVAL;
       return -1;
     }
-    unsigned char *bitmap = malloc((size_t)ex->bitmap_size);
+    bitmap = malloc((size_t)ex->bitmap_size);
     if(!bitmap) {
       hs_set_err(err, err_size, "out of memory");
       errno = ENOMEM;
@@ -1850,34 +1874,25 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
     for(uint32_t i = 0; i < new_alloc; i++) {
       hs_bitmap_set(bitmap, new_first + i, 1);
     }
-    bitmap_final = malloc((size_t)ex->bitmap_size);
-    if(!bitmap_final) {
+    if(hs_exfat_release_file_allocation(ex, &file, bitmap, patches,
+                                        err, err_size) != 0) {
       free(bitmap);
-      hs_set_err(err, err_size, "out of memory");
-      errno = ENOMEM;
       return -1;
-    }
-    memcpy(bitmap_final, bitmap, (size_t)ex->bitmap_size);
-    if(file.first_cluster && file.allocated_clusters) {
-      for(uint32_t i = 0; i < file.allocated_clusters; i++) {
-        hs_bitmap_set(bitmap_final, file.first_cluster + i, 0);
-      }
     }
     if(hs_append_fat_range_patch(ex, patches, new_first, new_alloc, 0,
                                  err, err_size) != 0 ||
        hs_patch_append(patches, bitmap_off, bitmap, (size_t)ex->bitmap_size,
                        err, err_size) != 0) {
       free(bitmap);
-      free(bitmap_final);
       return -1;
     }
     free(bitmap);
+    bitmap = NULL;
     tail_migrated = 1;
   }
 
   if(hs_append_data_patch(ex, patches, new_first, replacement,
                           replacement_size, err, err_size) != 0) {
-    free(bitmap_final);
     return -1;
   }
 
@@ -1892,21 +1907,8 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
                                                      file.entry_count));
   if(hs_patch_append(patches, file.entry_set_off, entry_set,
                      file.entry_count * 32U, err, err_size) != 0) {
-    free(bitmap_final);
     return -1;
   }
-  if(tail_migrated && file.first_cluster && file.allocated_clusters) {
-    if(hs_append_fat_range_patch(ex, patches, file.first_cluster,
-                                 file.allocated_clusters, 1,
-                                 err, err_size) != 0 ||
-       hs_patch_append(patches, bitmap_off, bitmap_final,
-                       (size_t)ex->bitmap_size, err, err_size) != 0) {
-      free(bitmap_final);
-      return -1;
-    }
-  }
-  free(bitmap_final);
-
   if(info) {
     snprintf(info->logical_path, sizeof(info->logical_path), "%s", file.rel);
     info->old_size = file.data_len;
